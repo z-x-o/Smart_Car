@@ -3,7 +3,7 @@
 #include <ESP8266WiFi.h>
 // 设置WiFi接入信息(请根据您的WiFi信息进行修改)
 const char* ssid = "HONOR";
-const char* password = "12345678.";
+const char* password = "12345678";
 const char* mqttServer = "test.mosquitto.org";
 
 WiFiClient wifiClient;
@@ -44,15 +44,15 @@ void connectMQTTserver(){
   
   // 连接MQTT服务器
   if (mqttClient.connect(clientId.c_str())) { 
-   // Serial.println("MQTT Server Connected.");
-  //  Serial.println("Server Address:");
-   // Serial.println(mqttServer);
-   // Serial.println("ClientId: ");
-  //  Serial.println(clientId);
+    Serial.println("MQTT Server Connected.");
+    Serial.println("Server Address:");
+    Serial.println(mqttServer);
+    Serial.println("ClientId: ");
+    Serial.println(clientId);
     subscribeTopic(); // 订阅指定主题
   } else {
-  //  Serial.print("MQTT Server Connect Failed. Client State:");
-   // Serial.println(mqttClient.state());
+    Serial.print("MQTT Server Connect Failed. Client State:");
+    Serial.println(mqttClient.state());
     delay(5000);
   }   
 }
@@ -96,11 +96,11 @@ void subscribeTopic(){
   
   // 通过串口监视器输出是否成功订阅主题以及订阅的主题名称
   if(mqttClient.subscribe(subTopic,1)){
-   // Serial.println("Subscribed to Topic:");
-   // Serial.println(subTopic);
+    Serial.println("Subscribed to Topic:");
+    Serial.println(subTopic);
   } else {
-   // Serial.print("Failed to Subscribe to Topic: ");
-   // Serial.println(subTopic);
+    Serial.print("Failed to Subscribe to Topic: ");
+    Serial.println(subTopic);
   }  
 }
 
@@ -114,9 +114,9 @@ void connectWifi(){
     digitalWrite(LED_BUILTIN, LOW);
     delay(300);
     digitalWrite(LED_BUILTIN, HIGH);
-    //Serial.print(".");
+    Serial.print(".");
   }
   digitalWrite(LED_BUILTIN, HIGH);
- // Serial.println("");
- // Serial.println("WiFi Connected!");  
+  Serial.println("");
+ Serial.println("WiFi Connected!");  
 }
