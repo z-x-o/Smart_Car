@@ -1,0 +1,237 @@
+#include <ESP8266WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <PubSubClient.h>
+#include <EEPROM.h>
+
+/*-------------------- 配置区 --------------------*/
+#define EEPROM_SIZE 192
+#define RECORD_SIZE 96
+#define RECORD0_ADDR 0
+#define RECORD1_ADDR 96
+
+const char* mqttServer = "test.mosquitto.org";
+const int mqttPort = 1883;
+const char* mqttTopic = "mqtt_SmartCar";
+
+/*------------------ 全局对象声明 ------------------*/
+AsyncWebServer server(80);
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+bool isAPMode = false;
+
+/*==================== 初始化设置 ====================*/
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  EEPROM.begin(EEPROM_SIZE);
+  WiFi.persistent(false);  // 新增：禁用WiFi配置自动保存
+
+  if(!tryConnectWiFi()) {
+    startAPMode();
+  } else {
+    initMQTT();
+  }
+}
+
+/*==================== 主循环 ====================*/
+void loop() {
+  if(isAPMode && millis() > 240000) ESP.restart();
+  
+  if(WiFi.status() == WL_CONNECTED) {
+    if(!mqttClient.connected()) connectMQTT();
+    mqttClient.loop();
+  }
+  delay(10);
+  yield();  // 新增：喂看门狗
+}
+
+/*=============== WiFi连接相关函数 ================*/
+bool tryConnectWiFi() {
+  String ssid[2], pass[2];
+  ssid[0] = readEEPROM(RECORD0_ADDR, 32);
+  pass[0] = readEEPROM(RECORD0_ADDR+32, 64);
+  ssid[1] = readEEPROM(RECORD1_ADDR, 32);
+  pass[1] = readEEPROM(RECORD1_ADDR+32, 64);
+
+  for(int i=0; i<2; i++) {
+    if(ssid[i].length() > 0 && connectWiFi(ssid[i], pass[i], 20)) {
+      if(i == 1) updateWiFiRecords(ssid[i], pass[i]);
+      WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& e) {
+        Serial.println("\nWiFi断开! 尝试重连...");
+        if(!tryConnectWiFi()) startAPMode();
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+bool connectWiFi(const String &ssid, const String &pass, int maxRetry) {
+  WiFi.mode(WIFI_STA);  // 新增：明确设置模式
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  
+  int retry = 0;
+  while(retry++ < maxRetry) {
+    digitalWrite(LED_BUILTIN, (retry%2) ? LOW : HIGH);
+    if(WiFi.status() == WL_CONNECTED) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      Serial.printf("连接成功! IP: %s\n", WiFi.localIP().toString().c_str());
+      return true;
+    }
+    delay(500);
+    Serial.print(".");
+    yield();  // 新增：喂看门狗
+  }
+  Serial.println("\n连接超时");
+  return false;
+}
+
+/*=============== AP模式相关函数 ================*/
+void startAPMode() {
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  if(!WiFi.softAP("SmartCar-AP", "12345678")) {
+    Serial.println("AP启动失败!");
+    delay(1000);
+    ESP.restart();
+  }
+  isAPMode = true;
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html><head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>设备配网</title>
+    <style>
+      body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;}
+      .container{max-width:400px;margin:50px auto;padding:30px;background:white;border-radius:10px;box-shadow:0 0 10px rgba(0,0,0,0.1);}
+      .form-group{margin-bottom:20px;}
+      input[type="text"],input[type="password"]{width:100%;padding:10px;margin-top:5px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box;}
+      input[type="submit"]{background:#4CAF50;color:white;padding:12px 25px;border:none;border-radius:5px;cursor:pointer;width:100%;}
+    </style>
+    </head>
+    <body>
+      <div class="container">
+        <h2 style="text-align:center;color:#333;">WiFi配置</h2>
+        <form action='/config' method='post'>
+          <div class="form-group">
+            <label>WiFi名称：</label>
+            <input type='text' name='ssid' required maxlength="31">
+          </div>
+          <div class="form-group">
+            <label>WiFi密码：</label>
+            <input type='password' name='pass' required maxlength="63">
+          </div>
+          <input type='submit' value='立即连接'>
+        </form>
+      </div>
+    </body></html>
+    )rawliteral";
+    request->send(200, "text/html; charset=utf-8", html);
+  });
+
+  server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String newSSID = request->arg("ssid");
+    String newPASS = request->arg("pass");
+    
+    if(newSSID.length()>31 || newPASS.length()>63) {
+      request->send(400, "text/plain; charset=utf-8", "错误：SSID或密码过长");
+      return;
+    }
+    
+    updateWiFiRecords(newSSID, newPASS);
+    request->send(200, "text/plain; charset=utf-8", "正在尝试连接...");
+    
+    // 延迟确保响应发送完成
+    delay(300);
+    
+    // 关闭当前服务器
+    server.end();
+    // 断开AP
+    WiFi.softAPdisconnect(true);
+    isAPMode = false;
+    
+    // 立即尝试连接
+    Serial.println("\n尝试新配置连接...");
+    WiFi.mode(WIFI_STA);
+    if(tryConnectWiFi()) {
+      initMQTT();
+    } else {
+      startAPMode();
+    }
+  });
+  
+  server.begin();
+  Serial.printf("AP模式已启动! IP: %s\n", WiFi.softAPIP().toString().c_str());
+}
+
+/*=============== MQTT相关函数 ================*/
+void initMQTT() {
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    char msg[length+1];
+    memcpy(msg, payload, length);
+    msg[length] = '\0';
+    Serial.print(msg);
+    
+    if(strcmp(msg, "open_led") == 0) digitalWrite(LED_BUILTIN, LOW);
+    else if(strcmp(msg, "close_led") == 0) digitalWrite(LED_BUILTIN, HIGH);
+  });
+  connectMQTT();
+}
+
+void connectMQTT() {
+  String clientId = "ESP8266-" + WiFi.macAddress();
+  while(!mqttClient.connected()) {
+    Serial.println("连接MQTT服务器...");
+    if(mqttClient.connect(clientId.c_str())) {
+      mqttClient.subscribe(mqttTopic);
+      Serial.printf("已订阅主题: %s\n", mqttTopic);
+    } else {
+      Serial.printf("MQTT连接失败，状态码: %d\n", mqttClient.state());
+      delay(5000);  // 修改：仅延迟不重启
+      Serial.println("正在重启.....");
+      ESP.restart();
+    }
+    yield();  // 新增：喂看门狗
+  }
+}
+
+/*=============== EEPROM操作函数 ================*/
+void updateWiFiRecords(String newSSID, String newPASS) {
+  String oldSSID = readEEPROM(RECORD0_ADDR, 32);
+  String oldPASS = readEEPROM(RECORD0_ADDR+32, 64);
+  
+  // 移动旧记录到历史位置
+  writeEEPROM(RECORD1_ADDR, oldSSID, oldPASS);
+  
+  // 存储新记录到最新位置
+  writeEEPROM(RECORD0_ADDR, newSSID, newPASS);
+  EEPROM.commit();
+}
+
+String readEEPROM(int addr, int maxLen) {
+  String data;
+  for(int i=0; i<maxLen; i++) {
+    char c = EEPROM.read(addr + i);
+    if(c == 0) break;
+    data += c;
+  }
+  return data;
+}
+
+void writeEEPROM(int addr, String ssid, String pass) {
+  // 写入SSID
+  for(int i=0; i<32; i++) {
+    EEPROM.write(addr+i, i<ssid.length() ? ssid[i] : 0);
+  }
+  // 写入密码
+  for(int i=0; i<64; i++) {
+    EEPROM.write(addr+32+i, i<pass.length() ? pass[i] : 0);
+  }
+}
