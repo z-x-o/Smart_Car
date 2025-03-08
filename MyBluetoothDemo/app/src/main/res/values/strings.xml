@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">MyBluetoothDemo</string>
+    <string name="is_bluetooth_support">检查设备是否支持蓝牙</string>
+    <string name="is_bluetooth_enabled">检查设备是否开启蓝牙</string>
+    <string name="bonded_device">查看已经绑定过的蓝牙设备</string>
+    <string name="find_device">查找蓝牙设备</string>
+
+    <string name="action_settings">设置</string>
+
+    <string name="waiting">等待连接</string>
+    <string name="stop_waiting">等待监听</string>
+    <string name="disconnect">断开</string>
+    <string name="hello">发送hello</string>
+    <string name="hi">发送hi</string>
+</resources>
