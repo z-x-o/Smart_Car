@@ -1,0 +1,280 @@
+#include <ESP8266WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <PubSubClient.h>
+#include <EEPROM.h>
+#include <FastLED.h>
+
+#define LED_PIN     D5
+#define NUM_LEDS    10
+#define CHIPSET     WS2812B
+#define COLOR_ORDER GRB
+#define BRIGHTNESS  128
+
+CRGB leds[NUM_LEDS];
+
+// 色温配置
+#define TEMPERATURE_1 Tungsten100W
+#define TEMPERATURE_2 OvercastSky
+#define DISPLAYTIME 20  // 色温切换间隔（秒）
+
+char ws_flag;
+/*-------------------- 配置区 --------------------*/
+#define EEPROM_SIZE 192
+#define RECORD_SIZE 96
+#define RECORD0_ADDR 0
+#define RECORD1_ADDR 96
+
+const char* mqttServer = "test.mosquitto.org";
+const int mqttPort = 1883;
+const char* mqttTopic = "mqtt_SmartCar";
+
+/*------------------ 全局对象声明 ------------------*/
+AsyncWebServer server(80);
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+bool isAPMode = false;
+
+/*==================== 初始化设置 ====================*/
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  EEPROM.begin(EEPROM_SIZE);
+  WiFi.persistent(false);  // 新增：禁用WiFi配置自动保存
+
+  FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS)
+     .setCorrection(TypicalSMD5050);
+    FastLED.setBrightness(0);
+   FastLED.clear();
+   FastLED.show();
+  if(!tryConnectWiFi()) {
+    startAPMode();
+  } else {
+    initMQTT();
+  }
+}
+
+/*==================== 主循环 ====================*/
+void loop() {
+  if(isAPMode && millis() > 240000) ESP.restart();
+  
+  if(WiFi.status() == WL_CONNECTED) {
+    if(!mqttClient.connected()) 
+          connectMQTT();
+    mqttClient.loop();
+  }
+  if(ws_flag)
+  {
+    
+     // 生成全彩红灯带（包含所有LED）
+   static uint8_t starthue = 0;
+   fill_rainbow(leds,       // 从第一个LED开始
+                NUM_LEDS,   // 填充全部LED
+                starthue--, // 自动递减色相
+                10);        // 减小色相间隔值使颜色过渡更平滑
+
+   // 自动切换色温（影响全部LED）
+   uint8_t current_sec = millis() / 1000;
+   FastLED.setTemperature((current_sec % (DISPLAYTIME * 2)) < DISPLAYTIME 
+                          ? TEMPERATURE_1 
+                         : TEMPERATURE_2);
+
+   // 持续更新显示（移除所有延迟和黑屏）
+    FastLED.show();
+    FastLED.delay(6);  // 微小延迟保持动画流畅  
+  }
+//FastLED.delay(10);
+ // delay(10);
+//  yield();  // 新增：喂看门狗
+}
+
+/*=============== WiFi连接相关函数 ================*/
+bool tryConnectWiFi() {
+  String ssid[2], pass[2];
+  ssid[0] = readEEPROM(RECORD0_ADDR, 32);
+  pass[0] = readEEPROM(RECORD0_ADDR+32, 64);
+  ssid[1] = readEEPROM(RECORD1_ADDR, 32);
+  pass[1] = readEEPROM(RECORD1_ADDR+32, 64);
+
+  for(int i=0; i<2; i++) {
+    if(ssid[i].length() > 0 && connectWiFi(ssid[i], pass[i], 20)) {
+      if(i == 1) updateWiFiRecords(ssid[i], pass[i]);
+      WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& e) {
+        Serial.println("\nWiFi断开! 尝试重连...");
+        if(!tryConnectWiFi()) startAPMode();
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+bool connectWiFi(const String &ssid, const String &pass, int maxRetry) {
+  WiFi.mode(WIFI_STA);  // 新增：明确设置模式
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  
+  int retry = 0;
+  while(retry++ < maxRetry) {
+    digitalWrite(LED_BUILTIN, (retry%2) ? LOW : HIGH);
+    if(WiFi.status() == WL_CONNECTED) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      Serial.printf("连接成功! IP: %s\n", WiFi.localIP().toString().c_str());
+      return true;
+    }
+    delay(500);
+    Serial.print(".");
+    yield();  // 新增：喂看门狗
+  }
+  Serial.println("\n连接超时");
+  return false;
+}
+
+/*=============== AP模式相关函数 ================*/
+void startAPMode() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  if(!WiFi.softAP("SmartCar-AP","")) ESP.restart();
+  isAPMode = true;
+
+  // 简化版配网页面
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = FPSTR(R"=====(
+      <html><head>
+        <meta charset="UTF-8">
+        <meta name=viewport content="width=device-width,initial-scale=1">
+        
+        <style>
+          body{display:flex;justify-content:center;background:#f0f4ff;}
+          .box{background:#fff;padding:2em;border-radius:1em;box-shadow:0 5px 15px rgba(0,0,0,0.1);margin:2em;max-width:400px;}
+          h1{color:#667eea;text-align:center;margin:0 0 1.5em;}
+          input{width:100%;padding:12px;margin:8px 0;border:2px solid #ddd;border-radius:8px;font-size:16px;}
+          button{background:#667eea;color:#fff;width:100%;padding:12px;border:none;border-radius:8px;font-size:16px;margin-top:1em;}
+        </style>
+      </head><body>
+        <div class=box>
+          <h1>智能车配网</h1>
+          <form onsubmit="fetch('/config',{method:'post',body:new FormData(this)})">
+            <input name=ssid placeholder="WiFi名称" required>
+            <input name=pass type=password placeholder="WiFi密码" required>
+            <button>连接网络</button>
+          </form>
+        </div>
+      </body></html>
+    )=====");
+    request->send(200, "text/html", html);
+  });
+
+  server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String newSSID = request->arg("ssid");
+    String newPASS = request->arg("pass");
+    
+    if(newSSID.length()>31 || newPASS.length()>63) {
+      request->send(400, "text/plain; charset=utf-8", "错误：SSID或密码过长");
+      return;
+    }
+    
+    updateWiFiRecords(newSSID, newPASS);
+    request->send(200, "text/plain; charset=utf-8", "正在尝试连接...");
+    
+    // 延迟确保响应发送完成
+    delay(300);
+    
+    // 关闭当前服务器
+    server.end();
+    // 断开AP
+    WiFi.softAPdisconnect(true);
+    isAPMode = false;
+    
+    // 立即尝试连接
+    Serial.println("\n尝试新配置连接...");
+    WiFi.mode(WIFI_STA);
+    if(tryConnectWiFi()) {
+      initMQTT();
+    } else {
+      startAPMode();
+    }
+  });
+  
+  server.begin();
+  Serial.printf("AP模式已启动! IP: %s\n", WiFi.softAPIP().toString().c_str());
+}
+
+/*=============== MQTT相关函数 ================*/
+void initMQTT() {
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    char msg[length+1];
+    memcpy(msg, payload, length);
+    msg[length] = '\0';
+    Serial.print(msg);
+    
+    if(strcmp(msg, "open_led") == 0) 
+    {
+      digitalWrite(LED_BUILTIN, LOW);
+      ws_flag=1;
+      FastLED.setBrightness(BRIGHTNESS);
+    }
+    else if(strcmp(msg, "close_led") == 0) 
+    {
+      digitalWrite(LED_BUILTIN, HIGH);
+     // digitalWrite(D5, LOW);
+      ws_flag=0;
+      FastLED.setBrightness(0);  
+      FastLED.clear();
+      FastLED.show();
+    }
+  });
+  connectMQTT();
+}
+
+void connectMQTT() {
+  String clientId = "ESP8266-" + WiFi.macAddress();
+  while(!mqttClient.connected()) {
+    Serial.println("连接MQTT服务器...");
+    if(mqttClient.connect(clientId.c_str())) {
+      mqttClient.subscribe(mqttTopic);
+      Serial.printf("已订阅主题: %s\n", mqttTopic);
+    } else {
+      Serial.printf("MQTT连接失败，状态码: %d\n", mqttClient.state());
+      delay(5000);  // 修改：仅延迟不重启
+      Serial.println("正在重启.....");
+      ESP.restart();
+    }
+    yield();  // 新增：喂看门狗
+  }
+}
+
+/*=============== EEPROM操作函数 ================*/
+void updateWiFiRecords(String newSSID, String newPASS) {
+  String oldSSID = readEEPROM(RECORD0_ADDR, 32);
+  String oldPASS = readEEPROM(RECORD0_ADDR+32, 64);
+  
+  // 移动旧记录到历史位置
+  writeEEPROM(RECORD1_ADDR, oldSSID, oldPASS);
+  
+  // 存储新记录到最新位置
+  writeEEPROM(RECORD0_ADDR, newSSID, newPASS);
+  EEPROM.commit();
+}
+
+String readEEPROM(int addr, int maxLen) {
+  String data;
+  for(int i=0; i<maxLen; i++) {
+    char c = EEPROM.read(addr + i);
+    if(c == 0) break;
+    data += c;
+  }
+  return data;
+}
+
+void writeEEPROM(int addr, String ssid, String pass) {
+  // 写入SSID
+  for(int i=0; i<32; i++) {
+    EEPROM.write(addr+i, i<ssid.length() ? ssid[i] : 0);
+  }
+  // 写入密码
+  for(int i=0; i<64; i++) {
+    EEPROM.write(addr+32+i, i<pass.length() ? pass[i] : 0);
+  }
+}

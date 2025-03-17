@@ -235,3 +235,444 @@ void writeEEPROM(int addr, String ssid, String pass) {
     EEPROM.write(addr+32+i, i<pass.length() ? pass[i] : 0);
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <ESP8266WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <PubSubClient.h>
+#include <EEPROM.h>
+
+/*-------------------- 配置区 --------------------*/
+#define EEPROM_SIZE 192
+#define RECORD_SIZE 96
+#define RECORD0_ADDR 0
+#define RECORD1_ADDR 96
+
+const char* mqttServer = "test.mosquitto.org";
+const int mqttPort = 1883;
+const char* mqttTopic = "mqtt_SmartCar";
+
+/*------------------ 全局对象声明 ------------------*/
+AsyncWebServer server(80);
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+bool isAPMode = false;
+
+/*==================== 初始化设置 ====================*/
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  EEPROM.begin(EEPROM_SIZE);
+  WiFi.persistent(false);  // 新增：禁用WiFi配置自动保存
+
+  if(!tryConnectWiFi()) {
+    startAPMode();
+  } else {
+    initMQTT();
+  }
+}
+
+/*==================== 主循环 ====================*/
+void loop() {
+  if(isAPMode && millis() > 240000) ESP.restart();
+  
+  if(WiFi.status() == WL_CONNECTED) {
+    if(!mqttClient.connected()) connectMQTT();
+    mqttClient.loop();
+  }
+  delay(10);
+  yield();  // 新增：喂看门狗
+}
+
+/*=============== WiFi连接相关函数 ================*/
+bool tryConnectWiFi() {
+  String ssid[2], pass[2];
+  ssid[0] = readEEPROM(RECORD0_ADDR, 32);
+  pass[0] = readEEPROM(RECORD0_ADDR+32, 64);
+  ssid[1] = readEEPROM(RECORD1_ADDR, 32);
+  pass[1] = readEEPROM(RECORD1_ADDR+32, 64);
+
+  for(int i=0; i<2; i++) {
+    if(ssid[i].length() > 0 && connectWiFi(ssid[i], pass[i], 20)) {
+      if(i == 1) updateWiFiRecords(ssid[i], pass[i]);
+      WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& e) {
+        Serial.println("\nWiFi断开! 尝试重连...");
+        if(!tryConnectWiFi()) startAPMode();
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+bool connectWiFi(const String &ssid, const String &pass, int maxRetry) {
+  WiFi.mode(WIFI_STA);  // 新增：明确设置模式
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  
+  int retry = 0;
+  while(retry++ < maxRetry) {
+    digitalWrite(LED_BUILTIN, (retry%2) ? LOW : HIGH);
+    if(WiFi.status() == WL_CONNECTED) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      Serial.printf("连接成功! IP: %s\n", WiFi.localIP().toString().c_str());
+      return true;
+    }
+    delay(500);
+    Serial.print(".");
+    yield();  // 新增：喂看门狗
+  }
+  Serial.println("\n连接超时");
+  return false;
+}
+
+/*=============== AP模式相关函数 ================*/
+void startAPMode() {
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  if(!WiFi.softAP("SmartCar-AP", "12345678")) {
+    Serial.println("AP启动失败!");
+    delay(1000);
+    ESP.restart();
+  }
+  isAPMode = true;
+
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>智能车配网</title>
+      <style>
+        * {
+          margin: 0;
+          padding: 0;
+          box-sizing: border-box;
+          font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+
+        body {
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          padding: 20px;
+        }
+
+        .container {
+          background: rgba(255, 255, 255, 0.95);
+          padding: 2.5rem;
+          border-radius: 1.5rem;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+          width: 100%;
+          max-width: 420px;
+          transition: transform 0.3s ease;
+        }
+
+        .container:hover {
+          transform: translateY(-5px);
+        }
+
+        h1 {
+          color: #2d3748;
+          font-size: 1.8rem;
+          text-align: center;
+          margin-bottom: 2rem;
+          position: relative;
+        }
+
+        h1::after {
+          content: '';
+          display: block;
+          width: 60px;
+          height: 3px;
+          background: #667eea;
+          margin: 0.8rem auto;
+          border-radius: 2px;
+        }
+
+        .form-group {
+          margin-bottom: 1.5rem;
+        }
+
+        label {
+          display: block;
+          color: #4a5568;
+          font-weight: 600;
+          margin-bottom: 0.5rem;
+          font-size: 0.9rem;
+        }
+
+        input {
+          width: 100%;
+          padding: 0.9rem;
+          border: 2px solid #e2e8f0;
+          border-radius: 0.75rem;
+          font-size: 1rem;
+          transition: all 0.3s ease;
+        }
+
+        input:focus {
+          outline: none;
+          border-color: #667eea;
+          box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+        }
+
+        button {
+          width: 100%;
+          padding: 1rem;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          color: white;
+          border: none;
+          border-radius: 0.75rem;
+          font-size: 1rem;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.3s ease;
+          position: relative;
+          overflow: hidden;
+        }
+
+        button:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        button::after {
+          content: '';
+          position: absolute;
+          top: -50%;
+          left: -50%;
+          width: 200%;
+          height: 200%;
+          background: rgba(255,255,255,0.1);
+          transform: rotate(45deg);
+          transition: all 0.3s ease;
+        }
+
+        button:hover::after {
+          left: 120%;
+        }
+
+        .loading {
+          display: none;
+          text-align: center;
+          color: #667eea;
+          font-size: 0.9rem;
+          margin-top: 1rem;
+        }
+
+        .dot-flashing {
+          display: inline-block;
+          position: relative;
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          background-color: #667eea;
+          animation: dotFlashing 1s infinite linear alternate;
+          margin-left: 8px;
+        }
+
+        .dot-flashing::before, .dot-flashing::after {
+          content: '';
+          display: inline-block;
+          position: absolute;
+          top: 0;
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          background-color: #667eea;
+        }
+
+        .dot-flashing::before {
+          left: -15px;
+          animation: dotFlashing 1s infinite alternate;
+          animation-delay: 0s;
+        }
+
+        .dot-flashing::after {
+          left: 15px;
+          animation: dotFlashing 1s infinite alternate;
+          animation-delay: 0.5s;
+        }
+
+        @keyframes dotFlashing {
+          0% { opacity: 0.2; transform: scale(0.8); }
+          50% { opacity: 1; transform: scale(1); }
+          100% { opacity: 0.2; transform: scale(0.8); }
+        }
+
+        @media (max-width: 480px) {
+          .container {
+            padding: 1.5rem;
+          }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>智能车联网配置</h1>
+        <form onsubmit="showLoading()">
+          <div class="form-group">
+            <label for="ssid">WiFi 名称</label>
+            <input type="text" id="ssid" name="ssid" placeholder="输入WiFi名称" required>
+          </div>
+          <div class="form-group">
+            <label for="pass">WiFi 密码</label>
+            <input type="password" id="pass" name="pass" placeholder="输入WiFi密码" required>
+          </div>
+          <button type="submit">立即连接</button>
+          <div class="loading" id="loading">
+            正在连接中
+            <div class="dot-flashing"></div>
+          </div>
+        </form>
+      </div>
+
+      <script>
+        function showLoading() {
+          event.preventDefault();
+          const formData = new FormData(event.target);
+          document.querySelector('button').disabled = true;
+          document.getElementById('loading').style.display = 'block';
+          
+          fetch('/config', {
+            method: 'POST',
+            body: new URLSearchParams(formData)
+          })
+          .then(response => {
+            if(!response.ok) throw new Error('配置失败');
+            return response.text();
+          })
+          .catch(error => {
+            alert(error.message);
+            location.reload();
+          });
+        }
+      </script>
+    </body>
+    </html>
+    )rawliteral";
+    request->send(200, "text/html; charset=utf-8", html);
+  });
+
+  server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String newSSID = request->arg("ssid");
+    String newPASS = request->arg("pass");
+    
+    if(newSSID.length()>31 || newPASS.length()>63) {
+      request->send(400, "text/plain; charset=utf-8", "错误：SSID或密码过长");
+      return;
+    }
+    
+    updateWiFiRecords(newSSID, newPASS);
+    request->send(200, "text/plain; charset=utf-8", "正在尝试连接...");
+    
+    // 延迟确保响应发送完成
+    delay(300);
+    
+    // 关闭当前服务器
+    server.end();
+    // 断开AP
+    WiFi.softAPdisconnect(true);
+    isAPMode = false;
+    
+    // 立即尝试连接
+    Serial.println("\n尝试新配置连接...");
+    WiFi.mode(WIFI_STA);
+    if(tryConnectWiFi()) {
+      initMQTT();
+    } else {
+      startAPMode();
+    }
+  });
+  
+  server.begin();
+  Serial.printf("AP模式已启动! IP: %s\n", WiFi.softAPIP().toString().c_str());
+}
+
+/*=============== MQTT相关函数 ================*/
+void initMQTT() {
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    char msg[length+1];
+    memcpy(msg, payload, length);
+    msg[length] = '\0';
+    Serial.print(msg);
+    
+    if(strcmp(msg, "open_led") == 0) digitalWrite(LED_BUILTIN, LOW);
+    else if(strcmp(msg, "close_led") == 0) digitalWrite(LED_BUILTIN, HIGH);
+  });
+  connectMQTT();
+}
+
+void connectMQTT() {
+  String clientId = "ESP8266-" + WiFi.macAddress();
+  while(!mqttClient.connected()) {
+    Serial.println("连接MQTT服务器...");
+    if(mqttClient.connect(clientId.c_str())) {
+      mqttClient.subscribe(mqttTopic);
+      Serial.printf("已订阅主题: %s\n", mqttTopic);
+    } else {
+      Serial.printf("MQTT连接失败，状态码: %d\n", mqttClient.state());
+      delay(5000);  // 修改：仅延迟不重启
+      Serial.println("正在重启.....");
+      ESP.restart();
+    }
+    yield();  // 新增：喂看门狗
+  }
+}
+
+/*=============== EEPROM操作函数 ================*/
+void updateWiFiRecords(String newSSID, String newPASS) {
+  String oldSSID = readEEPROM(RECORD0_ADDR, 32);
+  String oldPASS = readEEPROM(RECORD0_ADDR+32, 64);
+  
+  // 移动旧记录到历史位置
+  writeEEPROM(RECORD1_ADDR, oldSSID, oldPASS);
+  
+  // 存储新记录到最新位置
+  writeEEPROM(RECORD0_ADDR, newSSID, newPASS);
+  EEPROM.commit();
+}
+
+String readEEPROM(int addr, int maxLen) {
+  String data;
+  for(int i=0; i<maxLen; i++) {
+    char c = EEPROM.read(addr + i);
+    if(c == 0) break;
+    data += c;
+  }
+  return data;
+}
+
+void writeEEPROM(int addr, String ssid, String pass) {
+  // 写入SSID
+  for(int i=0; i<32; i++) {
+    EEPROM.write(addr+i, i<ssid.length() ? ssid[i] : 0);
+  }
+  // 写入密码
+  for(int i=0; i<64; i++) {
+    EEPROM.write(addr+32+i, i<pass.length() ? pass[i] : 0);
+  }
+}
